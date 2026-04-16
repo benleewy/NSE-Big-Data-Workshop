@@ -2,7 +2,7 @@
 
 ## Student Lesson Plan
 
-> **Disclaimer:** This course and its materials are for educational purposes only. AWS, its affiliates, and trainers delivering this course are in no way responsible for any losses, negative results, or consequences, direct or indirect, arising from the usage of the material and information within this course. This is not financial advice.
+> **Disclaimer:** *This course and its materials are for educational purposes only. In no way would be responsible, for any losses, negative results, or consequences, direct or indirect, arising from the usage of the material and information within this course. Stock market data analysis shown here is for learning purposes — not financial advice.*
 
 ---
 
