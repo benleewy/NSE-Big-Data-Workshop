@@ -1,0 +1,588 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NSE Big Data Workshop — Full infrastructure for Stock Market Analysis
+  using AWS Big Data Platform (EMR, Athena, Glue, S3, QuickSight).
+  Deploys VPC, Bastion Host, S3 bucket, Glue crawler, Athena workgroup,
+  and all IAM roles needed for the workshop.
+
+# ============================================================
+# METADATA — CloudFormation Console parameter grouping
+# ============================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VPCCIDR
+          - PublicSubnetCIDR
+          - PrivateSubnetCIDR
+      - Label:
+          default: "Access Configuration"
+        Parameters:
+          - SSHLocation
+      - Label:
+          default: "Data Configuration"
+        Parameters:
+          - NSEDataSourceBucket
+          - NSEDataSourcePrefix
+    ParameterLabels:
+      VPCCIDR:
+        default: "VPC CIDR Block"
+      PublicSubnetCIDR:
+        default: "Public Subnet CIDR"
+      PrivateSubnetCIDR:
+        default: "Private Subnet CIDR"
+      SSHLocation:
+        default: "SSH Access CIDR (your IP)"
+      NSEDataSourceBucket:
+        default: "Source S3 Bucket for NSE Data"
+      NSEDataSourcePrefix:
+        default: "Source S3 Prefix for NSE Data"
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+Parameters:
+  VPCCIDR:
+    Description: CIDR block for the workshop VPC
+    Type: String
+    Default: '10.200.0.0/20'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+
+  PublicSubnetCIDR:
+    Description: CIDR block for the public subnet
+    Type: String
+    Default: '10.200.0.0/24'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+
+  PrivateSubnetCIDR:
+    Description: CIDR block for the private subnet
+    Type: String
+    Default: '10.200.2.0/23'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+
+  SSHLocation:
+    Description: >
+      IP CIDR range allowed to SSH into the Bastion Host.
+      Use your public IP with /32 (e.g. 203.0.113.25/32).
+      Use 0.0.0.0/0 for open access (lab environments only).
+    Type: String
+    Default: '0.0.0.0/0'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid CIDR range (e.g. 203.0.113.25/32)
+
+  NSEDataSourceBucket:
+    Description: Public S3 bucket containing the NSE raw data files
+    Type: String
+    Default: 'dbsbdclassnv'
+
+  NSEDataSourcePrefix:
+    Description: S3 prefix (folder path) for the NSE raw data
+    Type: String
+    Default: 'indiastockex/raw'
+
+  LatestAmiId:
+    Description: Latest Amazon Linux 2 AMI (auto-resolved via SSM)
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+# ============================================================
+# RESOURCES
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # VPC & NETWORKING
+  # ----------------------------------------------------------
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPC'
+        - Key: Workshop
+          Value: NSE-BigData
+
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-IGW'
+
+  AttachGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- Public Subnet ---
+  PublicSubnet:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Public-Subnet'
+
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Public-RT'
+
+  PublicRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRTAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # --- Private Subnet ---
+  PrivateSubnet:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Private-Subnet'
+
+  PrivateRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Private-RT'
+
+  PrivateRoute:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnetRTAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # --- NAT Gateway ---
+  NATGatewayEIP:
+    Type: 'AWS::EC2::EIP'
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: 'AWS::EC2::NatGateway'
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-NAT'
+
+  # ----------------------------------------------------------
+  # SECURITY GROUPS
+  # ----------------------------------------------------------
+  BastionSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: SSH access to Bastion Host
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Bastion-SG'
+
+  EMRMasterSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security group for EMR Master node access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+          Description: SSH from allowed IPs
+        - IpProtocol: tcp
+          FromPort: 8888
+          ToPort: 8888
+          CidrIp: !Ref SSHLocation
+          Description: Hue Web UI
+        - IpProtocol: tcp
+          FromPort: 8088
+          ToPort: 8088
+          CidrIp: !Ref SSHLocation
+          Description: YARN Resource Manager
+        - IpProtocol: tcp
+          FromPort: 8157
+          ToPort: 8157
+          CidrIp: !Ref SSHLocation
+          Description: SOCKS Proxy for FoxyProxy
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: SSH from Bastion Host
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EMR-Master-SG'
+
+  EMRSlaveSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security group for EMR Core/Task nodes
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EMR-Slave-SG'
+
+  # ----------------------------------------------------------
+  # S3 BUCKET — Workshop data + Athena results
+  # ----------------------------------------------------------
+  WorkshopS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub 'nse-bigdata-${AWS::AccountId}-${AWS::Region}'
+      Tags:
+        - Key: Workshop
+          Value: NSE-BigData
+
+  AthenaResultsBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub 'nse-athena-results-${AWS::AccountId}-${AWS::Region}'
+      Tags:
+        - Key: Workshop
+          Value: NSE-BigData
+
+  # ----------------------------------------------------------
+  # IAM ROLES
+  # ----------------------------------------------------------
+
+  # --- Glue Service Role ---
+  GlueServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-GlueRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+      Policies:
+        - PolicyName: GlueS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                Resource:
+                  - !GetAtt WorkshopS3Bucket.Arn
+                  - !Sub '${WorkshopS3Bucket.Arn}/*'
+                  - !Sub 'arn:aws:s3:::${NSEDataSourceBucket}'
+                  - !Sub 'arn:aws:s3:::${NSEDataSourceBucket}/*'
+
+  # --- EC2 Instance Role (for Bastion Host) ---
+  BastionInstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-BastionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: BastionS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource:
+                  - !GetAtt WorkshopS3Bucket.Arn
+                  - !Sub '${WorkshopS3Bucket.Arn}/*'
+                  - !Sub 'arn:aws:s3:::${NSEDataSourceBucket}'
+                  - !Sub 'arn:aws:s3:::${NSEDataSourceBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListAllMyBuckets'
+                Resource: '*'
+
+  BastionInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - !Ref BastionInstanceRole
+
+  # --- EMR Service Role ---
+  EMRServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-EMRServiceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticmapreduce.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceRole'
+
+  # --- EMR EC2 Instance Role ---
+  EMREC2Role:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-EMREC2Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role'
+      Policies:
+        - PolicyName: EMRS3AndGlueAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource:
+                  - !GetAtt WorkshopS3Bucket.Arn
+                  - !Sub '${WorkshopS3Bucket.Arn}/*'
+                  - !GetAtt AthenaResultsBucket.Arn
+                  - !Sub '${AthenaResultsBucket.Arn}/*'
+                  - !Sub 'arn:aws:s3:::${NSEDataSourceBucket}'
+                  - !Sub 'arn:aws:s3:::${NSEDataSourceBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 'glue:*'
+                Resource: '*'
+
+  EMREC2InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - !Ref EMREC2Role
+
+  # ----------------------------------------------------------
+  # AWS GLUE — Database & Crawler
+  # ----------------------------------------------------------
+  GlueDatabase:
+    Type: 'AWS::Glue::Database'
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: nsedatabase
+        Description: NSE India Stock Exchange per-minute data
+
+  GlueCrawler:
+    Type: 'AWS::Glue::Crawler'
+    DependsOn: GlueDatabase
+    Properties:
+      Name: !Sub '${AWS::StackName}-NSECrawler'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: nsedatabase
+      Description: Crawls NSE stock data in S3 to build the Glue catalog table
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${WorkshopS3Bucket}/NSE/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  # ----------------------------------------------------------
+  # ATHENA — Workgroup
+  # ----------------------------------------------------------
+  AthenaWorkgroup:
+    Type: 'AWS::Athena::WorkGroup'
+    Properties:
+      Name: !Sub '${AWS::StackName}-Workgroup'
+      Description: Athena workgroup for NSE Big Data Workshop
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaResultsBucket}/athena-results/'
+
+  # ----------------------------------------------------------
+  # EC2 KEY PAIR
+  # ----------------------------------------------------------
+  WorkshopKeyPair:
+    Type: 'AWS::EC2::KeyPair'
+    Properties:
+      KeyName: !Sub '${AWS::StackName}-keypair'
+      Tags:
+        - Key: Workshop
+          Value: NSE-BigData
+
+  # ----------------------------------------------------------
+  # BASTION HOST EC2 INSTANCE
+  # ----------------------------------------------------------
+  BastionHost:
+    Type: 'AWS::EC2::Instance'
+    DependsOn: AttachGateway
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.medium
+      KeyName: !Ref WorkshopKeyPair
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      IamInstanceProfile: !Ref BastionInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Bastion'
+        - Key: Workshop
+          Value: NSE-BigData
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum install -y aws-cli jq
+
+          # Create working directory
+          mkdir -p /home/ec2-user/nse-data
+          chown ec2-user:ec2-user /home/ec2-user/nse-data
+
+          # Copy NSE data from source bucket to workshop bucket
+          aws s3 sync s3://${NSEDataSourceBucket}/${NSEDataSourcePrefix}/ s3://${WorkshopS3Bucket}/NSE/ --region ${AWS::Region}
+
+          # Also keep a local copy on the instance for quick preview
+          aws s3 sync s3://${NSEDataSourceBucket}/${NSEDataSourcePrefix}/ /home/ec2-user/nse-data/ --region ${AWS::Region}
+          chown -R ec2-user:ec2-user /home/ec2-user/nse-data
+
+          # Signal completion
+          echo "NSE data sync complete" > /home/ec2-user/setup-complete.txt
+          chown ec2-user:ec2-user /home/ec2-user/setup-complete.txt
+
+          # Run the Glue crawler to auto-discover schema
+          aws glue start-crawler --name ${AWS::StackName}-NSECrawler --region ${AWS::Region} || true
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  PublicSubnetId:
+    Description: Public Subnet ID (use for EMR master node)
+    Value: !Ref PublicSubnet
+
+  PrivateSubnetId:
+    Description: Private Subnet ID
+    Value: !Ref PrivateSubnet
+
+  BastionHostPublicIP:
+    Description: Public IP of the Bastion Host — SSH into this to start the workshop
+    Value: !GetAtt BastionHost.PublicIp
+
+  BastionHostPublicDNS:
+    Description: Public DNS of the Bastion Host
+    Value: !GetAtt BastionHost.PublicDnsName
+
+  SSHCommand:
+    Description: SSH command to connect to the Bastion Host
+    Value: !Sub >
+      ssh -i ${AWS::StackName}-keypair.pem ec2-user@${BastionHost.PublicIp}
+
+  S3BucketName:
+    Description: S3 bucket containing NSE stock data
+    Value: !Ref WorkshopS3Bucket
+
+  S3DataPath:
+    Description: Full S3 path to the NSE data
+    Value: !Sub 's3://${WorkshopS3Bucket}/NSE/'
+
+  AthenaResultsPath:
+    Description: S3 path for Athena query results
+    Value: !Sub 's3://${AthenaResultsBucket}/athena-results/'
+
+  GlueDatabaseName:
+    Description: Glue database name for Athena/Hive queries
+    Value: nsedatabase
+
+  GlueCrawlerName:
+    Description: Glue crawler name (run this after data is in S3)
+    Value: !Sub '${AWS::StackName}-NSECrawler'
+
+  AthenaWorkgroupName:
+    Description: Athena workgroup for running queries
+    Value: !Sub '${AWS::StackName}-Workgroup'
+
+  EMRServiceRoleArn:
+    Description: EMR Service Role ARN (use when creating EMR cluster)
+    Value: !GetAtt EMRServiceRole.Arn
+
+  EMREC2InstanceProfileArn:
+    Description: EMR EC2 Instance Profile ARN (use when creating EMR cluster)
+    Value: !GetAtt EMREC2InstanceProfile.Arn
+
+  EMRMasterSecurityGroupId:
+    Description: Security Group ID for EMR Master node
+    Value: !Ref EMRMasterSecurityGroup
+
+  EMRSlaveSecurityGroupId:
+    Description: Security Group ID for EMR Core/Task nodes
+    Value: !Ref EMRSlaveSecurityGroup
+
+  KeyPairName:
+    Description: EC2 Key Pair name (retrieve private key from SSM Parameter Store)
+    Value: !Ref WorkshopKeyPair
+
+  KeyPairSSMParameter:
+    Description: >
+      SSM Parameter Store path for the private key.
+      Retrieve with: aws ssm get-parameter --name /ec2/keypair/{KeyPairId} --with-decryption
+    Value: !Sub '/ec2/keypair/${WorkshopKeyPair.KeyPairId}'

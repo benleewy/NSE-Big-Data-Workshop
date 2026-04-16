@@ -1,0 +1,20 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# AWS credentials (never commit these!)
+*.pem
+*.csv
+credentials
+config
+
+# Temp files
+~$*
+*.tmp
